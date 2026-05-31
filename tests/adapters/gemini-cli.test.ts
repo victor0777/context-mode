@@ -316,4 +316,42 @@ describe("GeminiCLIAdapter", () => {
       );
     });
   });
+
+  // ── getHealthChecks defense-in-depth (issue #712) ─────
+  //
+  // Mirrors claude-code's Algo-D1 override: doctor calls
+  // `adapter.getHealthChecks(pluginRoot)` and resolves script paths
+  // directly via existsSync. No round-trip through a hook command
+  // string, so this class of layout bug cannot regress through a
+  // regex/parser mismatch.
+  describe("getHealthChecks (issue #712 defense in depth)", () => {
+    it("declares one check per HOOK_SCRIPTS entry", () => {
+      const repoRoot = resolve(__dirname, "..", "..");
+      const checks = adapter.getHealthChecks?.(repoRoot) ?? [];
+      expect(checks.length).toBeGreaterThanOrEqual(
+        Object.keys(HOOK_SCRIPTS).length,
+      );
+    });
+
+    it("every hook script check passes against the published tree", () => {
+      const repoRoot = resolve(__dirname, "..", "..");
+      const checks = adapter.getHealthChecks?.(repoRoot) ?? [];
+      const hookResults = checks
+        .filter((c) => c.name.startsWith("Hook script:"))
+        .map((c) => ({ name: c.name, result: c.check() }));
+      for (const { name, result } of hookResults) {
+        expect(result.status, `${name} -> ${result.detail ?? ""}`).toBe("OK");
+      }
+    });
+
+    it("FAIL surfaces when pluginRoot is a temporary empty dir", () => {
+      const tmp = join(homedir(), ".gemini-test-nonexistent-712");
+      const checks = adapter.getHealthChecks?.(tmp) ?? [];
+      const hookFail = checks
+        .filter((c) => c.name.startsWith("Hook script:"))
+        .map((c) => c.check());
+      expect(hookFail.length).toBeGreaterThan(0);
+      expect(hookFail.every((r) => r.status === "FAIL")).toBe(true);
+    });
+  });
 });
