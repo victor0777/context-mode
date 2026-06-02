@@ -61,6 +61,9 @@ jobs:
       - name: Assert bundle invariants (G3 — Issue #511 guardrail)
         run: npm run assert-bundle
 
+      - name: API probe savings smoke
+        run: npm run smoke:api-probe-savings
+
       - name: Run all tests
         shell: bash
         run: |

@@ -296,7 +296,7 @@ describe("formatReport — Bugs #5/#6/#7/#8", () => {
     // Five mandatory section headers, in order.
     const idx1 = text.indexOf("─── 1. Where you are now ───");
     const idx2 = text.indexOf("─── 2. What this chat captured");
-    const idx3 = text.indexOf("─── 3. The scope, getting wider ───");
+    const idx3 = text.indexOf("─── 3. Scope and source ───");
     const idx4 = text.indexOf("─── 4. The bottom line ───");
     const idx5 = text.indexOf("─── 5. What context-mode learned about how you work ───");
     expect(idx1).toBeGreaterThan(-1);
@@ -322,8 +322,8 @@ describe("formatReport — Bugs #5/#6/#7/#8", () => {
     expect(text).toMatch(/Files tracked\s+132/);
 
     // Section 3 — receipt-style rows (no "$X · Y%" framing anymore).
-    expect(text).toMatch(/This chat:/);
-    expect(text).toMatch(/All your work:/);
+    expect(text).toMatch(/Current chat \(conversation DB\):/);
+    expect(text).toMatch(/All your work \(available lifetime stores\):/);
     expect(text).toMatch(/17,493 captures across 123 projects/);
 
     // Section 4 — cost example + EXAMPLES disclaimer.
@@ -336,6 +336,60 @@ describe("formatReport — Bugs #5/#6/#7/#8", () => {
     // Footer.
     expect(text).toMatch(/Your AI talks less, remembers more, costs less/);
     expect(text).toMatch(/v1\.0\.111/);
+  });
+
+  test("scope receipt labels mixed stores when current chat exceeds lifetime estimate", () => {
+    const conv: ConversationStats = {
+      sessionId: "conv-scope",
+      events: 20,
+      firstEventMs: Date.UTC(2026, 5, 1),
+      lastEventMs: Date.UTC(2026, 5, 2),
+      daysAlive: 1,
+      compactCount: 0,
+      snapshotsConsumed: 0,
+      snapshotBytes: 0,
+      byCategory: [{ category: "file", count: 20, label: "Files tracked" }],
+    };
+    const lifetime: LifetimeStats = {
+      ...emptyLifetime(),
+      totalEvents: 15,
+      totalSessions: 2,
+      distinctProjects: 1,
+      firstEventMs: Date.UTC(2026, 4, 1),
+    };
+
+    const text = formatReport(baseReport(), "1.0.111", null, {
+      conversation: conv,
+      lifetime,
+      realBytes: {
+        conversation: {
+          eventDataBytes: 700_000,
+          bytesAvoided: 400_000,
+          bytesReturned: 50_000,
+          snapshotBytes: 0,
+          totalSavedTokens: 100_000,
+        },
+        lifetime: {
+          eventDataBytes: 50_000,
+          bytesAvoided: 300_000,
+          bytesReturned: 20_000,
+          snapshotBytes: 0,
+          totalSavedTokens: 75_000,
+        },
+      },
+      cwd: "/repo",
+      now: Date.UTC(2026, 5, 2),
+      locale: "en-US",
+      tz: "UTC",
+    });
+
+    expect(text).toContain("─── 3. Scope and source ───");
+    expect(text).toContain("Current chat (conversation DB):");
+    expect(text).toContain("All your work (available lifetime stores):");
+    expect(text).toContain("different scopes/stores");
+    expect(text).not.toContain("The scope, getting wider");
+    expect(text).not.toMatch(/^  This chat:/m);
+    expect(text).not.toMatch(/^  All your work:/m);
   });
 
   // ── Cycle 2: Persistent memory bar block must use lifetime category counts ──

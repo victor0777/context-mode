@@ -184,6 +184,33 @@ this repository or issue logs.
   snippets; use the session-level strict-compression headline in `ctx_stats` as
   the source of truth for whole-session savings.
 
+**How to evaluate live savings**
+
+Run a compact, no-secret live check with one representative call from each
+boundary. Record only the tool, raw bytes avoided, bytes returned, the relevant
+`ctx_stats` line, and pass/fail.
+
+1. Noisy command:
+   - Tool: `ctx_execute` or `ctx_batch_execute`
+   - Example intent: count/filter/aggregate noisy command output
+   - Pass: output is derived and compact; raw command output does not enter the
+     conversation.
+2. Large local file:
+   - Tool: `ctx_execute_file`
+   - Example intent: parse or summarize a large log/JSON file
+   - Pass: returned output is at least 10x smaller unless the requested summary
+     is intentionally detailed.
+3. Large JSON endpoint:
+   - Tool: `ctx_api_probe`
+   - Example intent: select a few JSON paths from a large response
+   - Pass: raw/compact ratio is at least 5x and selected paths are present.
+4. Final stats:
+   - Tool: `ctx_stats`
+   - Record: `Without context-mode`, `With context-mode`, kept-out percentage,
+     and any per-tool saved rows.
+   - Pass: the session-level strict-compression headline matches the selected
+     scope, and per-tool exact rows reconcile where exact byte events exist.
+
 **Original manual plan**
 
 - Document a smoke command using `ctx_api_probe` against the collaboration

@@ -2194,11 +2194,12 @@ function renderNarrative5Section(args: {
   out.push("");
   out.push("");
 
-  // ── Section 3 — Scope ladder, prose form (Mert: "cok daginik" → drop columns).
-  // Two short sentences instead of a 4-column table — the same numbers framed
-  // as "this chat" → "all your work" so the reader sees the scope getting wider
-  // without being asked to scan a wide grid.
-  out.push("  ─── 3. The scope, getting wider ───");
+  // ── Section 3 — Scope/source receipt.
+  // These rows may come from different stores/metric families: current-chat
+  // conversation DB vs available lifetime/multi-adapter stores. Label them
+  // explicitly so a narrow current-chat value that happens to be larger than
+  // a lifetime estimate does not read as an impossible hierarchy.
+  out.push("  ─── 3. Scope and source ───");
   out.push("");
   const convStartedYMD = conversation.firstEventMs && conversation.firstEventMs > 0
     ? new Intl.DateTimeFormat(locale, { timeZone: tz, year: "numeric", month: "short", day: "numeric" })
@@ -2211,11 +2212,14 @@ function renderNarrative5Section(args: {
   const distinctProj = lifetime?.distinctProjects ?? 0;
   const allCaps = lifetime?.totalEvents ?? multiAdapter?.totalEvents ?? 0;
   out.push(
-    `  This chat: ${kb(convBytes)} kept out · ${conversation.events.toLocaleString(locale)} captures${convStartedYMD ? ` · started ${convStartedYMD}` : ""}.`,
+    `  Current chat (conversation DB): ${kb(convBytes)} kept out · ${conversation.events.toLocaleString(locale)} captures${convStartedYMD ? ` · started ${convStartedYMD}` : ""}.`,
   );
   out.push(
-    `  All your work: ${kb(lifetimeBytes)} kept out · ${allCaps.toLocaleString(locale)} captures across ${distinctProj} project${distinctProj === 1 ? "" : "s"}${lifeStartedYMD ? ` · since ${lifeStartedYMD}` : ""}.`,
+    `  All your work (available lifetime stores): ${kb(lifetimeBytes)} kept out · ${allCaps.toLocaleString(locale)} captures across ${distinctProj} project${distinctProj === 1 ? "" : "s"}${lifeStartedYMD ? ` · since ${lifeStartedYMD}` : ""}.`,
   );
+  if (convBytes > lifetimeBytes && lifetimeBytes > 0) {
+    out.push("  Note: these rows use different scopes/stores; compare each row within its own scope, not as a strict hierarchy.");
+  }
   out.push("");
   out.push("");
 

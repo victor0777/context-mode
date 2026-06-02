@@ -335,6 +335,50 @@ describe("Analytics Metrics", () => {
       expect(output).toContain("ctx_execute");
       expect(output).not.toContain("src/large-fixture.json");
     });
+
+    it("reconciles exact per-tool bytes with the selected headline scope", () => {
+      insertSession(db, SESSION_ID, PROJECT_DIR, "2026-04-04 10:00:00");
+      const exactRows = [
+        { tool: "ctx_execute_file", avoided: 4_000, returned: 500 },
+        { tool: "ctx_batch_execute", avoided: 8_000, returned: 1_000 },
+        { tool: "ctx_api_probe", avoided: 12_000, returned: 600 },
+        { tool: "ctx_search", avoided: 0, returned: 1_200 },
+      ];
+      for (const row of exactRows) {
+        insertEvent(db, {
+          session_id: SESSION_ID,
+          type: row.tool === "ctx_api_probe" ? "api-probe" : "sandbox-execute",
+          category: "sandbox",
+          data: row.tool,
+          bytes_avoided: row.avoided,
+          bytes_returned: row.returned,
+        });
+      }
+
+      const runtime = {
+        ...runtimeStats,
+        bytesReturned: Object.fromEntries(exactRows.map((row) => [row.tool, row.returned])),
+        bytesIndexed: 0,
+        bytesSandboxed: exactRows.reduce((sum, row) => sum + row.avoided, 0),
+        calls: Object.fromEntries(exactRows.map((row) => [row.tool, 1])),
+      };
+      const report = engine.queryAll(runtime);
+      const output = formatReport(report);
+      const perToolAvoided = report.savings.by_tool.reduce((sum, row) => sum + (row.bytes_avoided ?? 0), 0);
+      const perToolReturned = report.savings.by_tool.reduce((sum, row) => sum + (row.bytes_returned ?? 0), 0);
+      const expectedAvoided = exactRows.reduce((sum, row) => sum + row.avoided, 0);
+      const expectedReturned = exactRows.reduce((sum, row) => sum + row.returned, 0);
+
+      expect(perToolAvoided).toBe(expectedAvoided);
+      expect(perToolReturned).toBe(expectedReturned);
+      expect(report.savings.kept_out).toBe(expectedAvoided);
+      expect(report.savings.total_bytes_returned).toBe(expectedReturned);
+      expect(output).toContain("87.9% reduction");
+      expect(output).toContain("ctx_execute_file");
+      expect(output).toContain("ctx_batch_execute");
+      expect(output).toContain("ctx_api_probe");
+      expect(output).toContain("ctx_search");
+    });
   });
 
   // ─── MCP tool usage ────────────────────────────────────

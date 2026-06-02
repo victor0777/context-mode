@@ -59,11 +59,14 @@ The remaining improvement area is validation and reporting fidelity:
 
 ### 1. Add a stats-scope consistency regression
 
+**Status: implemented**
+
 Target files:
 
 - `src/session/analytics.ts`
 - `tests/analytics/format-report.test.ts`
 - `tests/analytics/metrics.test.ts`
+- `tests/session/stats-output-format.test.ts`
 
 Add a fixture where:
 
@@ -77,8 +80,16 @@ Expected result:
 
 - `ctx_stats` output can still show session/project/lifetime numbers, but each
   line names the scope precisely enough that the values are auditable.
+- The narrative receipt now labels rows as:
+  - `Current chat (conversation DB)`
+  - `All your work (available lifetime stores)`
+- If the current-chat row is larger than the lifetime row, the report explains
+  that the rows use different scopes/stores and should not be read as a strict
+  hierarchy.
 
 ### 2. Add a per-tool reconciliation test
+
+**Status: implemented**
 
 Target files:
 
@@ -106,8 +117,12 @@ Expected result:
 
 - A future stats wording or aggregation change cannot silently inflate or
   deflate the reported savings.
+- The added fixture reconciles exact per-tool `bytes_avoided` and
+  `bytes_returned` with the active-session headline scope.
 
 ### 3. Promote the API-probe smoke into routine verification
+
+**Status: implemented**
 
 Target files:
 
@@ -127,8 +142,11 @@ Add it to the normal verification path as either:
 Expected result:
 
 - `npm run smoke:api-probe-savings` is not just documented; it is enforced.
+- CI now runs `npm run smoke:api-probe-savings`.
 
 ### 4. Add a compact live-evaluation recipe
+
+**Status: implemented**
 
 Target file:
 
@@ -154,6 +172,8 @@ Expected result:
 
 - A reviewer can answer "is token save working as intended?" without reading
   raw logs or trusting a single marketing-style percentage.
+- `ctx-api-probe-savings-attribution.md` now contains a live evaluation recipe
+  covering command output, local files, large JSON APIs, and final `ctx_stats`.
 
 ## Suggested Acceptance Criteria
 
@@ -175,6 +195,20 @@ The next improvement pass is complete when:
 2. Add the per-tool reconciliation fixture.
 3. Wire the API-probe smoke into routine verification.
 4. Add the compact live-evaluation recipe.
+
+## Implementation Notes
+
+Implemented in this pass:
+
+- `src/session/analytics.ts`: Section 3 wording changed from a widening
+  hierarchy to explicit scope/source rows.
+- `tests/session/stats-output-format.test.ts`: regression for mixed-store scope
+  wording when current-chat bytes exceed available lifetime-store bytes.
+- `tests/analytics/metrics.test.ts`: deterministic per-tool
+  avoided/returned-byte reconciliation fixture.
+- `.github/workflows/ci.yml`: API probe savings smoke added to CI.
+- `docs/improvement-plans/ctx-api-probe-savings-attribution.md`: live savings
+  evaluation recipe added.
 
 This order keeps the work reviewable: reporting correctness first, then
 regression coverage, then CI enforcement, then documentation.
