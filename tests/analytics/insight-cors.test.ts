@@ -3,11 +3,13 @@ import { mkdtempSync, mkdirSync, writeFileSync, rmSync, cpSync, symlinkSync } fr
 import { join, resolve } from "node:path";
 import { tmpdir } from "node:os";
 import { spawn, type ChildProcess } from "node:child_process";
+import { request as httpRequest } from "node:http";
 import Database from "better-sqlite3";
 
 const ROOT = resolve(import.meta.dirname, "../..");
 const SOURCE_SERVER = resolve(ROOT, "insight", "server.mjs");
 const DIST_INDEX_NAME = "index.html";
+const DELETE_TOKEN = "test-delete-token";
 
 const children: ChildProcess[] = [];
 const tempDirs: string[] = [];
@@ -190,6 +192,19 @@ async function waitForInsight(port: number, child: ChildProcess): Promise<void> 
   throw new Error(`Insight server did not become ready within 30s: ${lastError ?? "unknown"}. stderr: ${stderr || "(empty)"}`);
 }
 
+async function rawHttpGet(port: number, path: string): Promise<{ status: number; body: string }> {
+  return new Promise((resolveResult, reject) => {
+    const req = httpRequest({ host: "127.0.0.1", port, method: "GET", path }, (res) => {
+      let body = "";
+      res.setEncoding("utf8");
+      res.on("data", (chunk) => { body += chunk; });
+      res.on("end", () => resolveResult({ status: res.statusCode ?? 0, body }));
+    });
+    req.on("error", reject);
+    req.end();
+  });
+}
+
 function startInsight(runtime: "node" | "bun" = "node"): { port: number; child: ChildProcess } {
   const tempRoot = mkdtempSync(join(tmpdir(), "ctx-insight-cors-"));
   tempDirs.push(tempRoot);
@@ -214,6 +229,7 @@ function startInsight(runtime: "node" | "bun" = "node"): { port: number; child: 
       PORT: String(port),
       INSIGHT_SESSION_DIR: sessionsDir,
       INSIGHT_CONTENT_DIR: contentDir,
+      INSIGHT_DELETE_TOKEN: DELETE_TOKEN,
     },
   });
   children.push(child);
@@ -285,6 +301,30 @@ describe("Insight API — Node runtime", () => {
     expect(res.status).toBe(405);
     expect(res.headers.get("access-control-allow-origin")).toBeNull();
     expect(res.headers.get("access-control-allow-methods")).toBeNull();
+  });
+
+  test("static asset route does not serve files outside dist (Node)", async () => {
+    const res = await rawHttpGet(port, "/assets/../server.mjs");
+
+    expect(res.status).toBe(200);
+    expect(res.body).toContain("stub");
+    expect(res.body).not.toContain("context-mode Insight");
+    expect(res.body).not.toContain("apiDeleteSource");
+  });
+
+  test("DELETE requires local runtime token (Node)", async () => {
+    const withoutToken = await fetch(`http://127.0.0.1:${port}/api/content/feedface/source/7`, {
+      method: "DELETE",
+    });
+    expect(withoutToken.status).toBe(200);
+    expect(await withoutToken.json()).toEqual({ ok: false, error: "delete token required" });
+
+    const withToken = await fetch(`http://127.0.0.1:${port}/api/content/feedface/source/7`, {
+      method: "DELETE",
+      headers: { "x-context-mode-delete-token": DELETE_TOKEN },
+    });
+    expect(withToken.status).toBe(200);
+    expect(await withToken.json()).toEqual({ ok: true });
   });
 
   test("analytics totals count all matching rows even when detail lists are capped (Node)", async () => {

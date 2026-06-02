@@ -9,7 +9,7 @@
 
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import Database from "better-sqlite3";
-import { AnalyticsEngine } from "../../src/session/analytics.js";
+import { AnalyticsEngine, formatReport } from "../../src/session/analytics.js";
 
 // ─────────────────────────────────────────────────────────
 // Test helpers
@@ -27,7 +27,9 @@ function createSchema(db: Database.Database): void {
       data TEXT NOT NULL,
       source_hook TEXT NOT NULL,
       created_at TEXT NOT NULL DEFAULT (datetime('now')),
-      data_hash TEXT NOT NULL DEFAULT ''
+      data_hash TEXT NOT NULL DEFAULT '',
+      bytes_avoided INTEGER NOT NULL DEFAULT 0,
+      bytes_returned INTEGER NOT NULL DEFAULT 0
     );
     CREATE INDEX IF NOT EXISTS idx_session_events_session ON session_events(session_id);
     CREATE INDEX IF NOT EXISTS idx_session_events_type ON session_events(session_id, type);
@@ -62,12 +64,17 @@ interface InsertEventParams {
   source_hook?: string;
   created_at?: string;
   data_hash?: string;
+  bytes_avoided?: number;
+  bytes_returned?: number;
 }
 
 function insertEvent(db: Database.Database, params: InsertEventParams): void {
   db.prepare(`
-    INSERT INTO session_events (session_id, type, category, priority, data, source_hook, created_at, data_hash)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    INSERT INTO session_events (
+      session_id, type, category, priority, data, source_hook, created_at, data_hash,
+      bytes_avoided, bytes_returned
+    )
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `).run(
     params.session_id,
     params.type,
@@ -77,6 +84,8 @@ function insertEvent(db: Database.Database, params: InsertEventParams): void {
     params.source_hook ?? "PostToolUse",
     params.created_at ?? new Date().toISOString().replace("T", " ").slice(0, 19),
     params.data_hash ?? "",
+    params.bytes_avoided ?? 0,
+    params.bytes_returned ?? 0,
   );
 }
 
@@ -252,6 +261,79 @@ describe("Analytics Metrics", () => {
       expect(report.session.id).toBe("");
       expect(report.continuity.total_events).toBe(0);
       expect(report.continuity.compact_count).toBe(0);
+    });
+
+    it("uses exact per-tool event bytes when available", () => {
+      insertSession(db, SESSION_ID, PROJECT_DIR, "2026-04-04 10:00:00");
+      insertEvent(db, {
+        session_id: SESSION_ID,
+        type: "api-probe",
+        category: "sandbox",
+        data: "ctx_api_probe",
+        bytes_avoided: 9000,
+        bytes_returned: 500,
+      });
+
+      const report = engine.queryAll({
+        ...runtimeStats,
+        bytesReturned: { ctx_search: 2000 },
+        calls: { ctx_search: 1 },
+      });
+      const probe = report.savings.by_tool.find((t) => t.tool === "ctx_api_probe");
+
+      expect(probe).toBeDefined();
+      expect(probe!.calls).toBe(1);
+      expect(probe!.bytes_avoided).toBe(9000);
+      expect(probe!.bytes_returned).toBe(500);
+      expect(probe!.context_kb).toBe(0.5);
+    });
+
+    it("keeps exact tool savings separate from non-tool avoided-byte events", () => {
+      insertSession(db, SESSION_ID, PROJECT_DIR, "2026-04-04 10:00:00");
+      insertEvent(db, {
+        session_id: SESSION_ID,
+        type: "api-probe",
+        category: "sandbox",
+        data: "ctx_api_probe",
+        bytes_avoided: 12_000,
+        bytes_returned: 600,
+      });
+      insertEvent(db, {
+        session_id: SESSION_ID,
+        type: "index-write",
+        category: "file",
+        data: "src/large-fixture.json",
+        bytes_avoided: 80_000,
+      });
+
+      const report = engine.queryAll({
+        ...runtimeStats,
+        bytesReturned: { ctx_execute: 2048 },
+        bytesIndexed: 80_000,
+        bytesSandboxed: 12_000,
+        calls: { ctx_execute: 1 },
+      });
+      const output = formatReport(report);
+
+      const probe = report.savings.by_tool.find((t) => t.tool === "ctx_api_probe");
+      const execute = report.savings.by_tool.find((t) => t.tool === "ctx_execute");
+      const indexSource = report.savings.by_tool.find((t) => t.tool === "src/large-fixture.json");
+
+      expect(probe).toMatchObject({
+        calls: 1,
+        bytes_avoided: 12_000,
+        bytes_returned: 600,
+      });
+      expect(execute).toMatchObject({
+        calls: 1,
+        bytes_avoided: 0,
+        bytes_returned: 2048,
+      });
+      expect(indexSource).toBeUndefined();
+      expect(output).toContain("ctx_api_probe");
+      expect(output).toContain("11.7 KB saved");
+      expect(output).toContain("ctx_execute");
+      expect(output).not.toContain("src/large-fixture.json");
     });
   });
 

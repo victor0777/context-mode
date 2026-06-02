@@ -76,6 +76,34 @@ export function emitSandboxExecuteEvent(opts: {
 }
 
 /**
+ * Record a `ctx_api_probe` run. The probed response body stayed inside the
+ * sandbox; only the compact probe JSON entered context.
+ */
+export function emitApiProbeEvent(opts: {
+  sessionDbPath: string;
+  bytesReturned: number;
+  bytesAvoided: number;
+}): void {
+  withLatestSession(opts.sessionDbPath, (sdb, sid) => {
+    sdb.insertEvent(
+      sid,
+      {
+        type: "api-probe",
+        category: "sandbox",
+        priority: 1,
+        data: "ctx_api_probe",
+        project_dir: "",
+        attribution_source: "server",
+        attribution_confidence: 1,
+      },
+      "ctx-server",
+      undefined,
+      { bytesReturned: opts.bytesReturned, bytesAvoided: opts.bytesAvoided },
+    );
+  });
+}
+
+/**
  * Record a `ctx_index` / `trackIndexed` write — content kept out of
  * context by being chunked into FTS5 instead of returned inline.
  */

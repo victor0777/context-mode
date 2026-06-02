@@ -114,6 +114,11 @@ interface ExecuteOptions {
   /** Keep process running after timeout instead of killing it. */
   background?: boolean;
   /**
+   * Trusted CA bundle for child Node.js HTTPS/fetch calls. This is an
+   * explicit internal override, not inherited from the parent shell.
+   */
+  nodeExtraCaCerts?: string;
+  /**
    * Issue #45 — per-call cwd override for the shell language. When set,
    * the shell script runs in this directory instead of `#projectRoot`.
    * Non-shell languages keep their tmpDir sandbox cwd regardless (the
@@ -180,7 +185,7 @@ export class PolyglotExecutor {
   }
 
   async execute(opts: ExecuteOptions): Promise<ExecResult> {
-    const { language, code, timeout, background = false, cwd: cwdOverride } = opts;
+    const { language, code, timeout, background = false, cwd: cwdOverride, nodeExtraCaCerts } = opts;
     const tmpDir = mkdtempSync(join(OS_TMPDIR, ".ctx-mode-"));
 
     try {
@@ -200,7 +205,7 @@ export class PolyglotExecutor {
       const cwd = language === "shell"
         ? (cwdOverride ?? this.#projectRoot)
         : tmpDir;
-      const result = await this.#spawn(cmd, cwd, tmpDir, timeout, background);
+      const result = await this.#spawn(cmd, cwd, tmpDir, timeout, background, nodeExtraCaCerts);
 
       // Skip tmpDir cleanup if process was backgrounded — it may still need files
       if (!result.backgrounded) {
@@ -304,6 +309,7 @@ export class PolyglotExecutor {
     sandboxTmpDir: string,
     timeout: number | undefined,
     background = false,
+    nodeExtraCaCerts?: string,
   ): Promise<ExecResult> {
     return new Promise((res) => {
       // Only .cmd/.bat shims need shell on Windows; real executables don't.
@@ -332,7 +338,7 @@ export class PolyglotExecutor {
       const commonOpts = {
         cwd,
         stdio: ["ignore", "pipe", "pipe"] as ["ignore", "pipe", "pipe"],
-        env: this.#buildSafeEnv(sandboxTmpDir),
+        env: this.#buildSafeEnv(sandboxTmpDir, nodeExtraCaCerts),
         // On Unix, create a new process group so killTree can kill all children
         detached: !isWin,
         // Hide the spawned-process console window on Windows. Without this,
@@ -450,7 +456,7 @@ export class PolyglotExecutor {
     });
   }
 
-  #buildSafeEnv(tmpDir: string): Record<string, string> {
+  #buildSafeEnv(tmpDir: string, nodeExtraCaCerts?: string): Record<string, string> {
     const realHome = process.env.HOME ?? process.env.USERPROFILE ?? tmpDir;
 
     // Denylist: env vars that corrupt sandbox stdout, inject code, or break
@@ -583,6 +589,9 @@ export class PolyglotExecutor {
     }
     if (!env["PATH"]) {
       env["PATH"] = isWin ? "" : "/usr/local/bin:/usr/bin:/bin";
+    }
+    if (nodeExtraCaCerts) {
+      env["NODE_EXTRA_CA_CERTS"] = nodeExtraCaCerts;
     }
 
     // Windows-critical env vars and path fixes

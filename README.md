@@ -571,6 +571,10 @@ The Codex plugin manifest provides MCP via `.codex-plugin/mcp.json`, skills via
 > **Node/PATH note:** context-mode still needs `node` visible to the Codex process.
 > The plugin removes manual Codex config, but it does not vendor Node or inherit
 > login-shell PATH fixes automatically.
+>
+> **NFS-mounted development checkout:** if multiple servers mount the same
+> context-mode repository, each server still needs its own Node/npm/Codex hook
+> setup. See [`docs/nfs-mounted-install.md`](docs/nfs-mounted-install.md).
 
 **Manual fallback for Codex builds without `plugin_hooks`:**
 

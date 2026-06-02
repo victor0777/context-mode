@@ -1259,6 +1259,8 @@ describe("ctx_index: projectRoot path resolution (#365)", () => {
     delete cleanEnv.CLAUDE_CODE_ENTRYPOINT;
     delete cleanEnv.CLAUDE_PLUGIN_ROOT;
     delete cleanEnv.CLAUDE_SESSION_ID;
+    delete cleanEnv.CODEX_THREAD_ID;
+    delete cleanEnv.CODEX_CI;
     delete cleanEnv.GEMINI_PROJECT_DIR;
     delete cleanEnv.VSCODE_CWD;
     delete cleanEnv.OPENCODE_PROJECT_DIR;
@@ -3218,7 +3220,10 @@ describe("batch_execute FS read tracking", () => {
 // ═══════════════════════════════════════════════════════════════════════════
 
 import {
+  buildApiProbeCode,
   buildBatchNodeOptionsPrefix,
+  composeFetchRequestCacheKey,
+  redactSensitiveText,
   runBatchCommands,
   type BatchCommand,
 } from "../../src/server.js";
@@ -3234,6 +3239,77 @@ function mkMockExecutor(
 }
 
 const NOOP_PREFIX = ""; // tests don't need NODE_OPTIONS prefix
+
+describe("persistent index redaction", () => {
+  test("redactSensitiveText masks headers, JSON-like keys, signed params, and sk-style keys", () => {
+    const raw = [
+      "Authorization: Bearer sk-collab-dashboard",
+      "Cookie: session=abc; theme=dark",
+      '{"token":"raw-token","api_key":"raw-api-key","password":"pw"}',
+      "https://example.test/path?X-Amz-Signature=abcdef&safe=yes",
+      "plain sk-testsecret123456789 value",
+    ].join("\n");
+
+    const redacted = redactSensitiveText(raw);
+    expect(redacted.redacted).toBe(true);
+    expect(redacted.text).toContain("Authorization: Bearer [REDACTED]");
+    expect(redacted.text).toContain("Cookie: [REDACTED]");
+    expect(redacted.text).toContain('"token":[REDACTED]');
+    expect(redacted.text).toContain('"api_key":[REDACTED]');
+    expect(redacted.text).toContain("X-Amz-Signature=[REDACTED]");
+    expect(redacted.text).not.toContain("sk-collab-dashboard");
+    expect(redacted.text).not.toContain("raw-api-key");
+    expect(redacted.text).not.toContain("abcdef");
+  });
+
+  test("server persistent indexing paths use redacted text", () => {
+    const src = readFileSync(resolve(__dirname, "../../src/server.ts"), "utf-8");
+    expect(src).toContain("const redacted = redactSensitiveText(stdout)");
+    expect(src).toContain("store.index({ content: redacted.text");
+    expect(src).toContain("persistent.indexPlainText(redacted.text");
+    expect(src).toContain("store.indexJSON(redacted.text");
+    expect(src).toContain("Sensitive values were redacted before persistent indexing.");
+  });
+});
+
+describe("ctx_api_probe compact authenticated API mode", () => {
+  test("extractApiProbeResponseBytes reads only the compact bytes field", async () => {
+    const { extractApiProbeResponseBytes } = await import("../../src/server.js");
+    expect(extractApiProbeResponseBytes('{"status":200,"bytes":12345,"excerpt":"small"}')).toBe(12345);
+    expect(extractApiProbeResponseBytes('{"bytes":12.4}')).toBe(12);
+    expect(extractApiProbeResponseBytes('{"bytes":-1}')).toBeUndefined();
+    expect(extractApiProbeResponseBytes('not json')).toBeUndefined();
+  });
+
+  test("buildApiProbeCode emits compact status/bytes/selected JSON output", () => {
+    const code = buildApiProbeCode({
+      url: "https://api.example.test/items",
+      method: "GET",
+      headers: { Authorization: "Bearer secret" },
+      select: ["items.0.id", "status"],
+    });
+    expect(code).toContain("const select = [\"items.0.id\",\"status\"]");
+    expect(code).toContain("status: resp.status");
+    expect(code).toContain("bytes: Buffer.byteLength(text)");
+    expect(code).toContain("out.selected[path] = readPath(parsed, path)");
+    expect(code).toContain("out.excerpt = JSON.stringify(parsed).slice(0, 1000)");
+  });
+
+  test("ctx_api_probe handler has auth headers, ca_file, SSRF guard, and redacted output", () => {
+    const src = readFileSync(resolve(__dirname, "../../src/server.ts"), "utf-8");
+    const blockMatch = src.match(/server\.registerTool\(\s*"ctx_api_probe"[\s\S]+?server\.registerTool\(\s*"ctx_fetch_and_index"/);
+    expect(blockMatch).not.toBeNull();
+    const block = blockMatch![0];
+    expect(block).toContain("headers: z.record(z.string()).optional()");
+    expect(block).toContain("ca_file: z.string().optional()");
+    expect(block).toContain("const ssrfBlock = await ssrfGuard(url)");
+    expect(block).toContain("nodeExtraCaCerts: resolvedCaFile");
+    expect(block).toContain("redactSensitiveText(raw)");
+    expect(block).toContain("extractApiProbeResponseBytes(raw)");
+    expect(block).toContain("apiProbeResponseBytes");
+    expect(block).not.toMatch(/store\.index/);
+  });
+});
 
 describe("runBatchCommands serial path (concurrency=1)", () => {
   test("happy path: outputs in input order, no timeout cascade", async () => {
@@ -3491,20 +3567,49 @@ describe("runBatchCommands edge cases", () => {
     expect(outputs[0]).toContain("(no output)");
   });
 
-  test("nodeOptsPrefix is prepended to each command", async () => {
+  test("nodeOptsPrefix is prepended as a shell statement before each command", async () => {
     const seen: string[] = [];
     const exec = mkMockExecutor((code) => {
       seen.push(code);
       return { stdout: "ok" };
     });
     const cmds: BatchCommand[] = [{ label: "A", command: "echo hi" }];
-    await runBatchCommands(cmds, { timeout: 1000, concurrency: 1, nodeOptsPrefix: 'NODE_OPTIONS="--require /tmp/x" ' }, exec);
-    expect(seen[0]).toBe('NODE_OPTIONS="--require /tmp/x" echo hi');
+    await runBatchCommands(cmds, { timeout: 1000, concurrency: 1, nodeOptsPrefix: 'export NODE_OPTIONS="--require /tmp/x"; ' }, exec);
+    expect(seen[0]).toBe('export NODE_OPTIONS="--require /tmp/x"; echo hi');
   });
 
-  test("buildBatchNodeOptionsPrefix formats POSIX shell assignment", () => {
+  test("buildBatchNodeOptionsPrefix formats POSIX shell export statement", () => {
     const prefix = buildBatchNodeOptionsPrefix("bash", "/tmp/cm fs'preload.js");
-    expect(prefix).toBe("NODE_OPTIONS='--require /tmp/cm fs'\\''preload.js' ");
+    expect(prefix).toBe("export NODE_OPTIONS='--require /tmp/cm fs'\\''preload.js'; ");
+  });
+
+  test("POSIX nodeOptsPrefix does not break commands starting with shell reserved words", async () => {
+    if (process.platform === "win32") return;
+
+    const prefix = buildBatchNodeOptionsPrefix("bash", "/tmp/nonexistent-context-mode-preload.js");
+    const realExecutor = new PolyglotExecutor({ runtimes, projectRoot: tmpdir() });
+    const cmds: BatchCommand[] = [
+      { label: "for", command: "for x in a b; do echo for-$x; done" },
+      { label: "while", command: "i=0; while [ $i -lt 2 ]; do echo while-$i; i=$((i+1)); done" },
+      { label: "if", command: "if true; then echo if-ok; fi" },
+      { label: "function", command: "f() { echo fn-ok; }; f" },
+    ];
+
+    const { outputs, timedOut } = await runBatchCommands(
+      cmds,
+      { timeout: 5000, concurrency: 1, nodeOptsPrefix: prefix },
+      realExecutor,
+    );
+
+    const text = outputs.join("\n");
+    expect(timedOut).toBe(false);
+    expect(text).toContain("for-a");
+    expect(text).toContain("for-b");
+    expect(text).toContain("while-0");
+    expect(text).toContain("while-1");
+    expect(text).toContain("if-ok");
+    expect(text).toContain("fn-ok");
+    expect(text).not.toContain("syntax error near unexpected token");
   });
 
   test("buildBatchNodeOptionsPrefix formats PowerShell assignment", () => {
@@ -3714,6 +3819,8 @@ describe("ctx_fetch_and_index batch refactor", () => {
     expect(fetchHandlerSrc).toContain('coerceJsonArray');
     expect(fetchHandlerSrc).toContain('url: z.string()');
     expect(fetchHandlerSrc).toContain('source: z.string().optional()');
+    expect(fetchHandlerSrc).toContain('ca_file: z');
+    expect(fetchHandlerSrc).toContain('headers: z.record(z.string()).optional()');
   });
 
   test("handler exposes concurrency 1-8 with default 1", () => {
@@ -3734,8 +3841,49 @@ describe("ctx_fetch_and_index batch refactor", () => {
     expect(block).toContain("ttl: z");
     expect(block).toContain("Override the cache freshness window");
     expect(block).toContain("`ttl: 0` bypasses the cache like `force: true`");
-    expect(block).toContain("async ({ url, source, requests, concurrency, force, ttl })");
-    expect(block).toContain("fetchOneUrl(req.url, req.source, force, ttl)");
+    expect(block).toContain("async ({ url, source, ca_file, headers, requests, concurrency, force, ttl })");
+    expect(block).toContain("fetchOneUrl(req.url, req.source, req.headers, force, ttl, req.ca_file)");
+  });
+
+  test("handler supports authenticated cached fetch without leaking header values into labels", () => {
+    const fetchBlockMatch = fetchHandlerSrc.match(/registerTool\(\s*"ctx_fetch_and_index"[\s\S]+?registerTool\(\s*"ctx_batch_execute"/);
+    expect(fetchBlockMatch).not.toBeNull();
+    const block = fetchBlockMatch![0];
+    expect(block).toContain("headers: z.record(z.string()).optional()");
+    expect(fetchHandlerSrc).toContain("composeFetchRequestCacheKey(source, url, headers)");
+    expect(fetchHandlerSrc).toContain("buildFetchCode(url, outputPath, headers ?? {})");
+    expect(fetchHandlerSrc).not.toContain("Authorization: Bearer sk-collab-dashboard");
+  });
+
+  test("composeFetchRequestCacheKey adds stable non-secret fingerprint for headers", () => {
+    const a = composeFetchRequestCacheKey("docs", "https://example.test/api", {
+      Authorization: "Bearer first-secret",
+      Accept: "application/json",
+    });
+    const b = composeFetchRequestCacheKey("docs", "https://example.test/api", {
+      accept: "application/json",
+      authorization: "Bearer first-secret",
+    });
+    const c = composeFetchRequestCacheKey("docs", "https://example.test/api", {
+      Authorization: "Bearer second-secret",
+      Accept: "application/json",
+    });
+    expect(a).toBe(b);
+    expect(c).not.toBe(a);
+    expect(a).toContain("docs::https://example.test/api::headers:");
+    expect(a).not.toContain("first-secret");
+    expect(a).not.toContain("Authorization");
+  });
+
+  test("handler exposes ca_file and passes it through NODE_EXTRA_CA_CERTS without disabling TLS", () => {
+    const fetchBlockMatch = fetchHandlerSrc.match(/registerTool\(\s*"ctx_fetch_and_index"[\s\S]+?registerTool\(\s*"ctx_batch_execute"/);
+    expect(fetchBlockMatch).not.toBeNull();
+    const block = fetchBlockMatch![0];
+    expect(block).toContain("ca_file");
+    expect(fetchHandlerSrc).toContain("nodeExtraCaCerts: resolvedCaFile");
+    expect(fetchHandlerSrc).toContain("checkFilePathDenyPolicy(resolvedCaFile, \"ctx_fetch_and_index\")");
+    expect(fetchHandlerSrc).not.toMatch(/rejectUnauthorized\s*:\s*false/);
+    expect(fetchHandlerSrc).not.toMatch(/NODE_TLS_REJECT_UNAUTHORIZED/);
   });
 
   test("fetchOneUrl applies ttl override and treats ttl=0 as cache bypass (#648)", () => {
@@ -3743,6 +3891,7 @@ describe("ctx_fetch_and_index batch refactor", () => {
     expect(fetchOneSrc).not.toBeNull();
     const block = fetchOneSrc![0];
     expect(block).toContain("ttl: number | undefined");
+    expect(block).toContain("caFile: string | undefined");
     expect(block).toContain("if (!force && ttl !== 0)");
     expect(block).toContain("const cacheTtlMs = ttl ?? FETCH_TTL_MS");
     expect(block).toContain("ageMs < cacheTtlMs");
@@ -3978,6 +4127,10 @@ import { buildFetchCode } from "../../src/server.js";
 
 describe("buildFetchCode — embedded SSRF guard contract", () => {
   const generated = buildFetchCode("https://example.com/x", "/tmp/x");
+  const generatedWithHeaders = buildFetchCode("https://example.com/x", "/tmp/x", {
+    Authorization: "Bearer secret",
+    Accept: "application/json",
+  });
 
   test("strips proxy env vars (HTTP_PROXY / HTTPS_PROXY / ALL_PROXY)", () => {
     // A configured outbound proxy would route fetch through an arbitrary
@@ -3990,6 +4143,14 @@ describe("buildFetchCode — embedded SSRF guard contract", () => {
     expect(generated).toMatch(/delete process\.env\.http_proxy/);
     expect(generated).toMatch(/delete process\.env\.https_proxy/);
     expect(generated).toMatch(/delete process\.env\.all_proxy/);
+  });
+
+  test("authenticated fetch headers are applied but stripped on cross-origin redirects", () => {
+    expect(generatedWithHeaders).toContain('const requestHeaders = {"Authorization":"Bearer secret","Accept":"application/json"}');
+    expect(generatedWithHeaders).toContain("function headersFor(targetUrl)");
+    expect(generatedWithHeaders).toContain("new URL(targetUrl).origin === initialOrigin");
+    expect(generatedWithHeaders).toMatch(/\^\(authorization\|cookie\|set-cookie\|proxy-authorization\)\$/);
+    expect(generatedWithHeaders).toContain("headers: headersFor(currentUrl)");
   });
 
   test("embedded SSRF classifier is callable as `classifyIp` even when bundler renames the export (#bug-v1.0.133)", () => {

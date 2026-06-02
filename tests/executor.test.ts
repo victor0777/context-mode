@@ -219,6 +219,23 @@ describe("JavaScript Execution", () => {
     assert.ok(r.stdout.includes("async done"));
   });
 
+  test("JS: nodeExtraCaCerts is passed to the spawned Node process only", async () => {
+    const certPath = join(tmpdir(), `ctx-extra-ca-${process.pid}.pem`);
+    writeFileSync(certPath, "not a real cert\n", "utf-8");
+    try {
+      const r = await executor.execute({
+        language: "javascript",
+        code: "console.log(process.env.NODE_EXTRA_CA_CERTS || 'unset')",
+        nodeExtraCaCerts: certPath,
+      });
+      assert.equal(r.exitCode, 0);
+      assert.equal(r.stdout.trim(), certPath);
+      assert.notEqual(process.env.NODE_EXTRA_CA_CERTS, certPath);
+    } finally {
+      rmSync(certPath, { force: true });
+    }
+  });
+
   test("JS: require node:os module", async () => {
     const r = await executor.execute({
       language: "javascript",

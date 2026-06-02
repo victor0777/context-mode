@@ -10,7 +10,7 @@ import { createRoutingBlock } from "../routing-block.mjs";
 import { createToolNamer } from "../core/tool-naming.mjs";
 
 const toolNamer = createToolNamer("codex");
-const ROUTING_BLOCK = createRoutingBlock(toolNamer);
+const ROUTING_BLOCK = createRoutingBlock(toolNamer, { verbosity: "compact" });
 import {
   writeSessionEventsFile,
   buildSessionDirective,

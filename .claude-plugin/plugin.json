@@ -21,9 +21,9 @@
   ],
   "mcpServers": {
     "context-mode": {
-      "command": "node",
+      "command": "/home/ktl/.nvm/versions/node/v22.17.1/bin/node",
       "args": [
-        "${CLAUDE_PLUGIN_ROOT}/start.mjs"
+        "/home/ktl/projects/context-mode/start.mjs"
       ]
     }
   },

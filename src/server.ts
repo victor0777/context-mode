@@ -8,6 +8,7 @@ import { join, dirname, resolve, sep, isAbsolute } from "node:path";
 import { fileURLToPath } from "node:url";
 import { homedir, tmpdir, cpus, platform } from "node:os";
 import { request as httpsRequest } from "node:https";
+import { createHash, randomBytes } from "node:crypto";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { z } from "zod";
 import { PolyglotExecutor } from "./executor.js";
@@ -47,6 +48,7 @@ import {
 } from "./session/db.js";
 import { purgeSession } from "./session/purge.js";
 import {
+  emitApiProbeEvent,
   emitCacheHitEvent,
   emitIndexWriteEvent,
   emitSandboxExecuteEvent,
@@ -705,6 +707,10 @@ type ToolResult = {
   isError?: boolean;
 };
 
+type TrackResponseOptions = {
+  apiProbeResponseBytes?: number;
+};
+
 function storageErrorResult(err: unknown): ToolResult | null {
   if (!(err instanceof StorageDirectoryError)) return null;
   return {
@@ -818,7 +824,7 @@ function healCacheMidSession(): void {
   } catch { /* best effort */ }
 }
 
-function trackResponse(toolName: string, response: ToolResult): ToolResult {
+function trackResponse(toolName: string, response: ToolResult, options: TrackResponseOptions = {}): ToolResult {
   // Mid-session cache heal — one-shot, first tool call
   healCacheMidSession();
   // Prepend version outdated warning if needed
@@ -867,6 +873,17 @@ function trackResponse(toolName: string, response: ToolResult): ToolResult {
     );
   }
 
+  if (toolName === "ctx_api_probe" && typeof options.apiProbeResponseBytes === "number") {
+    const bytesAvoided = Math.max(0, Math.round(options.apiProbeResponseBytes) - bytes);
+    setImmediate(() =>
+      emitApiProbeEvent({
+        sessionDbPath: getSessionDbPath(),
+        bytesReturned: bytes,
+        bytesAvoided,
+      })
+    );
+  }
+
   return response;
 }
 
@@ -885,6 +902,34 @@ function trackIndexed(bytes: number, source: string = "unknown"): void {
       })
     );
   }
+}
+
+export interface SensitiveTextRedactionResult {
+  text: string;
+  redacted: boolean;
+}
+
+const SENSITIVE_TEXT_PATTERNS: Array<[RegExp, string]> = [
+  [/\b(Authorization\s*:\s*Bearer)\s+["']?[^"'\s,;]+["']?/gi, "$1 [REDACTED]"],
+  [/\b(Authorization\s*:\s*Basic)\s+["']?[^"'\s,;]+["']?/gi, "$1 [REDACTED]"],
+  [/\b(Cookie|Set-Cookie)\s*:\s*[^\n\r]+/gi, "$1: [REDACTED]"],
+  [
+    /(["']?(?:api[-_]?key|apikey|token|access[-_]?token|refresh[-_]?token|secret|password|passwd|pwd|client[-_]?secret|private[-_]?key|signature)["']?\s*[:=]\s*)["']?[^"',\s;&}]+["']?/gi,
+    "$1[REDACTED]",
+  ],
+  [
+    /([?&](?:X-Amz-Signature|X-Amz-Credential|X-Amz-Security-Token|signature|sig|token|access_token|api_key|apikey)=)[^&\s]+/gi,
+    "$1[REDACTED]",
+  ],
+  [/\bsk-[A-Za-z0-9][A-Za-z0-9._-]{8,}\b/g, "[REDACTED]"],
+];
+
+export function redactSensitiveText(input: string): SensitiveTextRedactionResult {
+  let text = input;
+  for (const [pattern, replacement] of SENSITIVE_TEXT_PATTERNS) {
+    text = text.replace(pattern, replacement);
+  }
+  return { text, redacted: text !== input };
 }
 
 // ─────────────────────────────────────────────────────────
@@ -1035,7 +1080,7 @@ function checkDenyPolicy(
   toolName: string,
 ): ToolResult | null {
   try {
-    const policies = readBashPolicies(process.env.CLAUDE_PROJECT_DIR);
+    const policies = readBashPolicies(getProjectDir());
     const result = evaluateCommandDenyOnly(command, policies);
     if (result.decision === "deny") {
       return trackResponse(toolName, {
@@ -1064,7 +1109,7 @@ function checkNonShellDenyPolicy(
   try {
     const commands = extractShellCommands(code, language);
     if (commands.length === 0) return null;
-    const policies = readBashPolicies(process.env.CLAUDE_PROJECT_DIR);
+    const policies = readBashPolicies(getProjectDir());
     for (const cmd of commands) {
       const result = evaluateCommandDenyOnly(cmd, policies);
       if (result.decision === "deny") {
@@ -1340,7 +1385,7 @@ export function buildBatchNodeOptionsPrefix(shellPath: string, preloadPath: stri
     return `set "NODE_OPTIONS=${option.replace(/"/g, '""')}" && `;
   }
 
-  return `NODE_OPTIONS=${quotePosixSingle(option)} `;
+  return `export NODE_OPTIONS=${quotePosixSingle(option)}; `;
 }
 
 /**
@@ -1800,12 +1845,16 @@ function indexStdout(
 ): { content: Array<{ type: "text"; text: string }> } {
   const store = getStore();
   trackIndexed(Buffer.byteLength(stdout));
-  const indexed = store.index({ content: stdout, source, attribution: currentAttribution() });
+  const redacted = redactSensitiveText(stdout);
+  const indexed = store.index({ content: redacted.text, source, attribution: currentAttribution() });
+  const redactionNote = redacted.redacted
+    ? "\nSensitive values were redacted before persistent indexing."
+    : "";
   return {
     content: [
       {
         type: "text" as const,
-        text: `Indexed ${indexed.totalChunks} sections (${indexed.codeChunks} with code) from: ${indexed.label}\nUse ctx_search(queries: ["..."]) to query this content. Use source: "${indexed.label}" to scope results.`,
+        text: `Indexed ${indexed.totalChunks} sections (${indexed.codeChunks} with code) from: ${indexed.label}${redactionNote}\nUse ctx_search(queries: ["..."]) to query this content. Use source: "${indexed.label}" to scope results.`,
       },
     ],
   };
@@ -1829,7 +1878,8 @@ function intentSearch(
 
   // Index into the PERSISTENT store so user can ctx_search() later
   const persistent = getStore();
-  const indexed = persistent.indexPlainText(stdout, source, undefined, currentAttribution());
+  const redacted = redactSensitiveText(stdout);
+  const indexed = persistent.indexPlainText(redacted.text, source, undefined, currentAttribution());
 
   // Search the persistent store directly (porter → trigram → fuzzy)
   let results = persistent.searchWithFallback(intent, maxResults, source);
@@ -1842,6 +1892,9 @@ function intentSearch(
       `Indexed ${indexed.totalChunks} sections from "${source}" into knowledge base.`,
       `No sections matched intent "${intent}" in ${totalLines}-line output (${(totalBytes / 1024).toFixed(1)}KB).`,
     ];
+    if (redacted.redacted) {
+      lines.push("Sensitive values were redacted before persistent indexing.");
+    }
     if (distinctiveTerms.length > 0) {
       lines.push("");
       lines.push(`Searchable terms: ${distinctiveTerms.join(", ")}`);
@@ -1857,6 +1910,10 @@ function intentSearch(
     `${results.length} sections matched "${intent}" (${totalLines} lines, ${(totalBytes / 1024).toFixed(1)}KB):`,
     "",
   ];
+  if (redacted.redacted) {
+    lines.push("Sensitive values were redacted before persistent indexing.");
+    lines.push("");
+  }
 
   for (const r of results) {
     const preview = r.content.split("\n")[0].slice(0, 120);
@@ -2621,7 +2678,7 @@ function resolveGfmPluginPath(): string {
 // Subprocess code that fetches a URL, detects Content-Type, and outputs a
 // __CM_CT__:<type> marker on the first line so the handler can route to the
 // appropriate indexing strategy.  HTML is converted to markdown via Turndown.
-export function buildFetchCode(url: string, outputPath: string): string {
+export function buildFetchCode(url: string, outputPath: string, headers: Record<string, string> = {}): string {
   const turndownPath = JSON.stringify(resolveTurndownPath());
   const gfmPath = JSON.stringify(resolveGfmPluginPath());
   const escapedOutputPath = JSON.stringify(outputPath);
@@ -2657,6 +2714,7 @@ const fs = require('fs');
 const dns = require('no' + 'de:dns');
 const dnsPromises = require('no' + 'de:dns/promises');
 const url = ${JSON.stringify(url)};
+const requestHeaders = ${JSON.stringify(headers)};
 const outputPath = ${escapedOutputPath};
 
 // Strip proxy env vars from this subprocess only. A configured outbound
@@ -2797,10 +2855,20 @@ function emit(ct, content) {
 // IP (e.g. http://169.254.169.254/) skips getaddrinfo entirely. Walk the
 // chain manually so every hop runs through classifyIp before the next fetch.
 const MAX_REDIRECTS = 5;
+const initialOrigin = new URL(url).origin;
+function headersFor(targetUrl) {
+  if (new URL(targetUrl).origin === initialOrigin) return requestHeaders;
+  const out = {};
+  for (const [key, value] of Object.entries(requestHeaders)) {
+    if (/^(authorization|cookie|set-cookie|proxy-authorization)$/i.test(key)) continue;
+    out[key] = value;
+  }
+  return out;
+}
 async function fetchWithManualRedirect(initialUrl) {
   let currentUrl = initialUrl;
   for (let redirectCount = 0; redirectCount <= MAX_REDIRECTS; redirectCount++) {
-    const resp = await fetch(currentUrl, { redirect: 'manual' });
+    const resp = await fetch(currentUrl, { redirect: 'manual', headers: headersFor(currentUrl) });
     if (resp.status < 300 || resp.status >= 400) return resp;
     const location = resp.headers.get('location') || resp.headers.get('Location');
     if (!location) return resp;
@@ -2915,9 +2983,30 @@ function formatFetchTtl(ttlMs: number): string {
   return `${ttlMs}ms`;
 }
 
+function normalizedHeaderEntries(headers: Record<string, string> | undefined): Array<[string, string]> {
+  return Object.entries(headers ?? {})
+    .map(([key, value]) => [key.toLowerCase(), String(value)] as [string, string])
+    .sort(([a], [b]) => a.localeCompare(b));
+}
+
+export function composeFetchRequestCacheKey(
+  source: string | undefined,
+  url: string,
+  headers: Record<string, string> | undefined,
+): string {
+  const base = composeFetchCacheKey(source, url);
+  const entries = normalizedHeaderEntries(headers);
+  if (entries.length === 0) return base;
+  const fingerprint = createHash("sha256")
+    .update(JSON.stringify(entries))
+    .digest("hex")
+    .slice(0, 12);
+  return `${base}::headers:${fingerprint}`;
+}
+
 type FetchOneResult =
   | { kind: "cached"; label: string; chunkCount: number; estimatedBytes: number; ageStr: string; ttlStr: string }
-  | { kind: "fetched"; url: string; source?: string; markdown: string; header: string }
+  | { kind: "fetched"; url: string; source?: string; cacheKey: string; markdown: string; header: string }
   | { kind: "fetch_error"; url: string; error: string; reason: "exit" | "read" | "empty" | "throw" };
 
 /**
@@ -3071,19 +3160,26 @@ export function classifyIp(rawIp: string): "block" | "private" | "public" {
   return "public";
 }
 
-async function fetchOneUrl(url: string, source: string | undefined, force: boolean | undefined, ttl: number | undefined): Promise<FetchOneResult> {
+async function fetchOneUrl(
+  url: string,
+  source: string | undefined,
+  headers: Record<string, string> | undefined,
+  force: boolean | undefined,
+  ttl: number | undefined,
+  caFile: string | undefined,
+): Promise<FetchOneResult> {
   // SSRF guard — reject file://, javascript:, loopback, RFC1918, IMDS, link-local
   // BEFORE any cache lookup or subprocess spawn. Even cached entries shouldn't
   // serve a previously-poisoned source label.
   const ssrfBlock = await ssrfGuard(url);
   if (ssrfBlock) return ssrfBlock;
+  const cacheKey = composeFetchRequestCacheKey(source, url, headers);
 
   if (!force && ttl !== 0) {
     const store = getStore();
     // Cache key composes (source, url) so two distinct URLs sharing the same
     // `source` label do not collide — they each get their own cache slot
     // (commit 1f1243e regression test enforced).
-    const cacheKey = composeFetchCacheKey(source, url);
     const meta = store.getSourceMeta(cacheKey);
     if (meta) {
       const indexedAt = new Date(meta.indexedAt + "Z"); // SQLite datetime is UTC without Z
@@ -3102,11 +3198,32 @@ async function fetchOneUrl(url: string, source: string | undefined, force: boole
 
   const outputPath = join(tmpdir(), `ctx-fetch-${Date.now()}-${Math.random().toString(36).slice(2)}.dat`);
   try {
-    const fetchCode = buildFetchCode(url, outputPath);
+    const resolvedCaFile = caFile ? resolveProjectPath(caFile) : undefined;
+    if (resolvedCaFile) {
+      const caDenied = checkFilePathDenyPolicy(resolvedCaFile, "ctx_fetch_and_index");
+      if (caDenied) {
+        return {
+          kind: "fetch_error",
+          url,
+          error: "ca_file denied by Read policy",
+          reason: "exit",
+        };
+      }
+      if (!existsSync(resolvedCaFile)) {
+        return {
+          kind: "fetch_error",
+          url,
+          error: `ca_file not found: ${resolvedCaFile}`,
+          reason: "exit",
+        };
+      }
+    }
+    const fetchCode = buildFetchCode(url, outputPath, headers ?? {});
     const result = await executor.execute({
       language: "javascript",
       code: fetchCode,
       timeout: 30_000,
+      nodeExtraCaCerts: resolvedCaFile,
     });
     if (result.exitCode !== 0) {
       // Subprocess fetch failure — undici / fetch can surface EAI_AGAIN /
@@ -3142,7 +3259,7 @@ async function fetchOneUrl(url: string, source: string | undefined, force: boole
     if (markdown.length === 0) {
       return { kind: "fetch_error", url, error: "empty content", reason: "empty" };
     }
-    return { kind: "fetched", url, source, markdown, header };
+    return { kind: "fetched", url, source, cacheKey, markdown, header };
   } catch (err: unknown) {
     return {
       kind: "fetch_error",
@@ -3167,26 +3284,30 @@ interface IndexedFetchResult {
  * fetched results and calls this one-at-a-time to avoid SQLite WAL contention
  * (PRD finding E).
  */
-function indexFetched(f: { url: string; source?: string; markdown: string; header: string }): IndexedFetchResult {
+function indexFetched(f: { url: string; source?: string; cacheKey: string; markdown: string; header: string }): IndexedFetchResult {
   const store = getStore();
-  // Storage label composed via composeFetchCacheKey so two URLs sharing a
-  // `source` label do not overwrite each other (commit 1f1243e). ctx_search()
-  // still finds both via LIKE-mode source filter on the `source` substring.
-  const storageLabel = composeFetchCacheKey(f.source, f.url);
+  // Storage label includes a non-secret header fingerprint when authenticated
+  // fetch headers are present, so distinct auth contexts never share cache rows.
+  const storageLabel = f.cacheKey;
   const attribution = currentAttribution();
+  const redacted = redactSensitiveText(f.markdown);
   let indexed: IndexResult;
   if (f.header === "__CM_CT__:json") {
-    indexed = store.indexJSON(f.markdown, storageLabel, undefined, attribution);
+    indexed = store.indexJSON(redacted.text, storageLabel, undefined, attribution);
   } else if (f.header === "__CM_CT__:text") {
-    indexed = store.indexPlainText(f.markdown, storageLabel, undefined, attribution);
+    indexed = store.indexPlainText(redacted.text, storageLabel, undefined, attribution);
   } else {
-    indexed = store.index({ content: f.markdown, source: storageLabel, attribution });
+    indexed = store.index({ content: redacted.text, source: storageLabel, attribution });
   }
   // Track AFTER the FTS5 write succeeds — failed indexes shouldn't inflate the counter.
   trackIndexed(Buffer.byteLength(f.markdown));
-  const preview = f.markdown.length > FETCH_PREVIEW_LIMIT
-    ? charSafePrefix(f.markdown, FETCH_PREVIEW_LIMIT) + "\n\n…[truncated — use ctx_search() for full content]"
-    : f.markdown;
+  const redactionNote = redacted.redacted
+    ? "Sensitive values were redacted before persistent indexing.\n\n"
+    : "";
+  const previewBody = redacted.text.length > FETCH_PREVIEW_LIMIT
+    ? charSafePrefix(redacted.text, FETCH_PREVIEW_LIMIT) + "\n\n…[truncated — use ctx_search() for full content]"
+    : redacted.text;
+  const preview = redactionNote + previewBody;
   return {
     label: indexed.label,
     totalChunks: indexed.totalChunks,
@@ -3194,6 +3315,160 @@ function indexFetched(f: { url: string; source?: string; markdown: string; heade
     preview,
   };
 }
+
+export function buildApiProbeCode(input: {
+  url: string;
+  method: string;
+  headers: Record<string, string>;
+  body?: string;
+  select: string[];
+}): string {
+  return `
+const url = ${JSON.stringify(input.url)};
+const method = ${JSON.stringify(input.method)};
+const headers = ${JSON.stringify(input.headers)};
+const body = ${JSON.stringify(input.body)};
+const select = ${JSON.stringify(input.select)};
+
+function readPath(value, path) {
+  const parts = String(path || '').split('.').filter(Boolean);
+  let cur = value;
+  for (const part of parts) {
+    if (cur == null) return undefined;
+    if (Array.isArray(cur) && /^\\d+$/.test(part)) cur = cur[Number(part)];
+    else cur = cur[part];
+  }
+  return cur;
+}
+
+async function main() {
+  const started = Date.now();
+  const resp = await fetch(url, {
+    method,
+    headers,
+    body: body === undefined ? undefined : body,
+    redirect: 'manual',
+  });
+  const contentType = resp.headers.get('content-type') || '';
+  const text = await resp.text();
+  const out = {
+    url,
+    method,
+    status: resp.status,
+    ok: resp.ok,
+    content_type: contentType,
+    bytes: Buffer.byteLength(text),
+    elapsed_ms: Date.now() - started,
+    selected: {},
+    excerpt: '',
+  };
+  if (contentType.includes('application/json') || contentType.includes('+json')) {
+    try {
+      const parsed = JSON.parse(text);
+      for (const path of select) out.selected[path] = readPath(parsed, path);
+      if (select.length === 0) {
+        out.excerpt = JSON.stringify(parsed).slice(0, 1000);
+      }
+    } catch {
+      out.excerpt = text.slice(0, 1000);
+    }
+  } else {
+    out.excerpt = text.slice(0, 1000);
+  }
+  console.log(JSON.stringify(out, null, 2));
+}
+main().catch((err) => {
+  console.error(err && err.stack ? err.stack : String(err));
+  process.exit(1);
+});
+`;
+}
+
+export function extractApiProbeResponseBytes(output: string): number | undefined {
+  try {
+    const parsed = JSON.parse(output) as { bytes?: unknown };
+    const bytes = parsed.bytes;
+    if (typeof bytes !== "number" || !Number.isFinite(bytes) || bytes < 0) return undefined;
+    return Math.round(bytes);
+  } catch {
+    return undefined;
+  }
+}
+
+server.registerTool(
+  "ctx_api_probe",
+  {
+    title: "Compact API Probe",
+    description: `Probe an HTTP API and return compact evidence instead of indexing or echoing the full body.
+
+WHEN:
+  - You need status, byte count, content type, and a few selected JSON fields from an internal API
+  - You need authenticated API checks with headers but do not want headers or full responses persisted
+
+WHEN NOT:
+  - You need long-lived searchable content — use ctx_fetch_and_index
+  - You need arbitrary local shell processing — use ctx_execute
+
+RETURNS:
+  Compact JSON containing request URL, method, HTTP status, content type, response size, elapsed time, selected JSON paths, and a short excerpt for non-JSON or unselected responses. Authorization/cookies/secrets are redacted before the response enters context.
+
+EXAMPLE: ctx_api_probe(url: "http://192.168.0.193:7851/api/v2/inbox", headers: {Authorization: "Bearer ..."}, select: ["items.0.request_id", "items.0.status"])`,
+    inputSchema: z.object({
+      url: z.string().describe("HTTP or HTTPS URL to probe"),
+      method: z.string().optional().default("GET").describe("HTTP method, default GET"),
+      headers: z.record(z.string()).optional().describe("Request headers. Secret header values are never echoed back."),
+      body: z.string().optional().describe("Optional request body for POST/PUT/PATCH probes"),
+      select: z.array(z.string()).optional().default([]).describe("Dot paths to extract from JSON responses, e.g. items.0.status"),
+      ca_file: z.string().optional().describe("Optional trusted CA bundle path for internal HTTPS endpoints"),
+    }),
+  },
+  async ({ url, method, headers, body, select, ca_file }) => {
+    const ssrfBlock = await ssrfGuard(url);
+    if (ssrfBlock) {
+      const error = ssrfBlock.kind === "fetch_error" ? ssrfBlock.error : "blocked by URL safety policy";
+      return trackResponse("ctx_api_probe", {
+        content: [{ type: "text" as const, text: `API probe blocked: ${error}` }],
+        isError: true,
+      });
+    }
+
+    const resolvedCaFile = ca_file ? resolveProjectPath(ca_file) : undefined;
+    if (resolvedCaFile) {
+      const caDenied = checkFilePathDenyPolicy(resolvedCaFile, "ctx_api_probe");
+      if (caDenied) return caDenied;
+      if (!existsSync(resolvedCaFile)) {
+        return trackResponse("ctx_api_probe", {
+          content: [{ type: "text" as const, text: `API probe error: ca_file not found: ${resolvedCaFile}` }],
+          isError: true,
+        });
+      }
+    }
+
+    const upperMethod = String(method ?? "GET").toUpperCase();
+    const code = buildApiProbeCode({
+      url,
+      method: upperMethod,
+      headers: headers ?? {},
+      body,
+      select: select ?? [],
+    });
+    const result = await executor.execute({
+      language: "javascript",
+      code,
+      timeout: 30_000,
+      nodeExtraCaCerts: resolvedCaFile,
+    });
+    const raw = result.exitCode === 0 ? result.stdout : combineExecOutput(result);
+    const apiProbeResponseBytes = result.exitCode === 0 ? extractApiProbeResponseBytes(raw) : undefined;
+    const redacted = redactSensitiveText(raw);
+    return trackResponse("ctx_api_probe", {
+      content: [{ type: "text" as const, text: redacted.text || "(no output)" }],
+      isError: result.exitCode !== 0,
+    }, {
+      apiProbeResponseBytes,
+    });
+  },
+);
 
 server.registerTool(
   "ctx_fetch_and_index",
@@ -3228,6 +3503,15 @@ EXAMPLE: ctx_fetch_and_index(
         .describe(
           "Label for the indexed content when using single `url` (e.g., 'React useEffect docs', 'Supabase Auth API'). For batch, put source in each requests entry.",
         ),
+      ca_file: z
+        .string()
+        .optional()
+        .describe(
+          "Optional trusted CA bundle path for internal HTTPS endpoints. TLS verification stays enabled; relative paths resolve against the caller project.",
+        ),
+      headers: z.record(z.string()).optional().describe(
+        "Optional request headers for authenticated docs/API pages. Header values are never displayed or indexed; headers affect the cache key via a non-secret fingerprint.",
+      ),
       requests: z
         .preprocess(
           coerceJsonArray,
@@ -3235,6 +3519,8 @@ EXAMPLE: ctx_fetch_and_index(
             z.object({
               url: z.string().describe("URL to fetch"),
               source: z.string().optional().describe("Label for this URL's indexed content"),
+              ca_file: z.string().optional().describe("Optional trusted CA bundle path for this URL"),
+              headers: z.record(z.string()).optional().describe("Optional request headers for this URL"),
             }),
           ).min(1),
         )
@@ -3271,13 +3557,13 @@ EXAMPLE: ctx_fetch_and_index(
         ),
     }),
   },
-  async ({ url, source, requests, concurrency, force, ttl }) => {
+  async ({ url, source, ca_file, headers, requests, concurrency, force, ttl }) => {
     // Normalize input: legacy {url} or new {requests: [...]}.
     // requests wins when both are provided (explicit batch intent).
-    const batch: { url: string; source?: string }[] = requests
+    const batch: { url: string; source?: string; ca_file?: string; headers?: Record<string, string> }[] = requests
       ? requests
       : url
-        ? [{ url, source }]
+        ? [{ url, source, ca_file, headers }]
         : [];
 
     if (batch.length === 0) {
@@ -3296,7 +3582,7 @@ EXAMPLE: ctx_fetch_and_index(
     // Parallel fetch via shared runPool primitive. capByCpuCount only for batch
     // — single-URL doesn't need the cap (only one job, executor is one subprocess).
     const jobs: PoolJob<FetchOneResult>[] = batch.map((req) => ({
-      run: () => fetchOneUrl(req.url, req.source, force, ttl),
+      run: () => fetchOneUrl(req.url, req.source, req.headers, force, ttl, req.ca_file),
     }));
     const { settled, effectiveConcurrency, capped } = await runPool(jobs, {
       concurrency: requestedConcurrency,
@@ -3594,7 +3880,8 @@ EXAMPLE: ctx_batch_execute(
         .map((c) => c.label)
         .join(",")
         .slice(0, 80)}`;
-      const indexed = store.index({ content: stdout, source, attribution: currentAttribution() });
+      const redacted = redactSensitiveText(stdout);
+      const indexed = store.index({ content: redacted.text, source, attribution: currentAttribution() });
 
       // Commands inventory — list what the agent actually ran so the
       // response itself documents intent, not just per-section echoes.
@@ -3629,6 +3916,7 @@ EXAMPLE: ctx_batch_execute(
       const output = [
         `Executed ${commands.length} commands (${totalLines} lines, ${(totalBytes / 1024).toFixed(1)}KB). ` +
           `Indexed ${indexed.totalChunks} sections. Searched ${queries.length} queries.`,
+        redacted.redacted ? "Sensitive values were redacted before persistent indexing." : "",
         "",
         ...commandsInventory,
         "",
@@ -4717,6 +5005,7 @@ server.registerTool(
           INSIGHT_SESSION_DIR: sessDir,
           INSIGHT_CONTENT_DIR: insightContentDirResolved,
           INSIGHT_PARENT_PID: String(process.pid),
+          INSIGHT_DELETE_TOKEN: randomBytes(24).toString("hex"),
         },
         detached: true,
         stdio: "ignore",

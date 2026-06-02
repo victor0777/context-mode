@@ -14,7 +14,10 @@ import { createToolNamer } from "./core/tool-naming.mjs";
 // ── Factory functions ─────────────────────────────────────
 
 export function createRoutingBlock(t, options = {}) {
-  const { includeCommands = true, toolSearchBootstrap = false } = options;
+  const { includeCommands = true, toolSearchBootstrap = false, verbosity = "full" } = options;
+  if (verbosity === "compact") {
+    return createCompactRoutingBlock(t, { includeCommands, toolSearchBootstrap });
+  }
   return `
 <context_window_protection>
   <priority_instructions>
@@ -75,6 +78,40 @@ ${includeCommands ? `
     → Call purge MCP tool with confirm: true. Warn: irreversible.
 
     After /clear or /compact: knowledge base preserved. Tell user: "context-mode knowledge base preserved. Use \`ctx purge\` to start fresh."
+  </ctx_commands>
+` : ''}
+</context_window_protection>`;
+}
+
+export function createCompactRoutingBlock(t, options = {}) {
+  const { includeCommands = true, toolSearchBootstrap = false } = options;
+  return `
+<context_window_protection>
+  <priority_instructions>
+    Raw tool output enters conversation memory. Use context-mode tools to keep raw bytes in the sandbox and return only derived answers.
+  </priority_instructions>
+${toolSearchBootstrap ? `
+  <deferred_tool_bootstrap>
+    If ctx_* schemas are not loaded, ToolSearch(query: "select:${t("ctx_batch_execute")},${t("ctx_search")},${t("ctx_execute")},${t("ctx_execute_file")},${t("ctx_fetch_and_index")}") once, then retry.
+  </deferred_tool_bootstrap>
+` : ''}
+  <tool_selection_hierarchy>
+    0. MEMORY: ${t("ctx_search")}(sort: "timeline") for resume/compaction decisions, errors, plans, prompts.
+    1. GATHER: ${t("ctx_batch_execute")}(commands, queries) for parallel research; raw outputs are indexed, matching sections returned.
+    2. FOLLOW-UP: ${t("ctx_search")}(queries: ["q1", "q2"]) for already-indexed captures and memory.
+    3. PROCESS: ${t("ctx_execute")} or ${t("ctx_execute_file")} to filter/count/parse/summarize; only console.log output enters context.
+  </tool_selection_hierarchy>
+
+  <when_not_to_use>
+    Bash/Read/WebFetch are fine for short observation or edits. For analysis of command output, files, or web pages, prefer ${t("ctx_batch_execute")}, ${t("ctx_execute_file")}, or ${t("ctx_fetch_and_index")} so raw bytes stay out.
+  </when_not_to_use>
+
+  <file_writing_policy>
+    Persistent writes use native Write/Edit. ${t("ctx_execute")} and ${t("ctx_execute_file")} are for analysis, not host filesystem edits.
+  </file_writing_policy>
+${includeCommands ? `
+  <ctx_commands>
+    "ctx stats" -> call stats tool verbatim. "ctx doctor" -> doctor checklist. "ctx upgrade" -> upgrade checklist. "ctx purge" -> irreversible reset.
   </ctx_commands>
 ` : ''}
 </context_window_protection>`;

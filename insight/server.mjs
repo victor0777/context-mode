@@ -9,10 +9,11 @@
  */
 
 import { readFileSync, readdirSync, statSync, existsSync, mkdirSync } from "node:fs";
-import { join, dirname, extname, normalize } from "node:path";
+import { join, dirname, extname, normalize, resolve, sep } from "node:path";
 import { homedir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { createServer as createHttpServer } from "node:http";
+import { randomBytes } from "node:crypto";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const PORT = process.env.PORT || 4747;
@@ -51,6 +52,7 @@ if (isBun) {
 const SESSION_DIR = process.env.INSIGHT_SESSION_DIR || join(homedir(), ".claude", "context-mode", "sessions");
 const CONTENT_DIR = process.env.INSIGHT_CONTENT_DIR || join(homedir(), ".claude", "context-mode", "content");
 const DIST_DIR = join(__dirname, "dist");
+const DELETE_TOKEN = process.env.INSIGHT_DELETE_TOKEN || randomBytes(24).toString("hex");
 
 // ── Response cache (5min TTL) ────────────────────────────
 // Prevents double DB open when dashboard loads /analytics + /category-analytics
@@ -1126,7 +1128,14 @@ function apiCategoryAnalytics() {
 
 // ── Router ───────────────────────────────────────────────
 
-function route(method, pathname, params) {
+function hasValidDeleteToken(req) {
+  if (req?.headers?.get) {
+    return req.headers.get("x-context-mode-delete-token") === DELETE_TOKEN;
+  }
+  return req?.headers?.["x-context-mode-delete-token"] === DELETE_TOKEN;
+}
+
+function route(method, pathname, params, req) {
   if (pathname === "/api/overview") return apiOverview();
   if (pathname === "/api/analytics") return cached("analytics", apiAnalytics);
   if (pathname === "/api/category-analytics") return cached("category-analytics", apiCategoryAnalytics);
@@ -1149,6 +1158,7 @@ function route(method, pathname, params) {
     return apiSessionEvents(parts[3], decodeURIComponent(parts[5]));
   }
   if (method === "DELETE" && pathname.startsWith("/api/content/")) {
+    if (!hasValidDeleteToken(req)) return { ok: false, error: "delete token required" };
     const parts = pathname.split("/");
     if (!isValidHash(parts[3])) return { error: "invalid hash" };
     return apiDeleteSource(parts[3], Number(parts[5]));
@@ -1166,7 +1176,14 @@ const MIME = {
 
 function serveStaticFile(pathname) {
   const ext = extname(pathname);
-  const filePath = join(DIST_DIR, pathname);
+  let decoded;
+  try { decoded = decodeURIComponent(pathname); } catch { return null; }
+  const relative = decoded.replace(/^[/\\]+/, "");
+  const filePath = resolve(DIST_DIR, relative);
+  const distRoot = resolve(DIST_DIR);
+  if (filePath !== distRoot && !(filePath + sep).startsWith(distRoot + sep)) {
+    return null;
+  }
   try {
     const content = readFileSync(filePath);
     return { content, type: MIME[ext] || "application/octet-stream" };
@@ -1196,7 +1213,11 @@ if (!existsSync(join(DIST_DIR, "index.html"))) {
 
 // ── Server (dual runtime) ────────────────────────────────
 
-const indexHTML = readFileSync(join(DIST_DIR, "index.html"), "utf8");
+const rawIndexHTML = readFileSync(join(DIST_DIR, "index.html"), "utf8");
+const runtimeConfigScript = `<script>window.__CONTEXT_MODE_INSIGHT__=${JSON.stringify({ deleteToken: DELETE_TOKEN })};</script>`;
+const indexHTML = rawIndexHTML.includes("</head>")
+  ? rawIndexHTML.replace("</head>", `${runtimeConfigScript}</head>`)
+  : `${runtimeConfigScript}${rawIndexHTML}`;
 const API_JSON_HEADERS = { "Content-Type": "application/json" };
 
 if (isBun) {
@@ -1206,7 +1227,7 @@ if (isBun) {
     hostname: "127.0.0.1",
     fetch(req) {
       const url = new URL(req.url);
-      const data = route(req.method, url.pathname, url.searchParams);
+      const data = route(req.method, url.pathname, url.searchParams, req);
       if (data !== null) {
         return new Response(JSON.stringify(data), {
           headers: API_JSON_HEADERS,
@@ -1227,7 +1248,7 @@ if (isBun) {
     const url = new URL(req.url, `http://localhost:${PORT}`);
     if (req.method === "OPTIONS") { res.writeHead(405); res.end(); return; }
 
-    const data = route(req.method, url.pathname, url.searchParams);
+    const data = route(req.method, url.pathname, url.searchParams, req);
     if (data !== null) {
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(JSON.stringify(data));

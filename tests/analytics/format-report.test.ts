@@ -186,6 +186,44 @@ describe("formatReport", () => {
       expect(batchLine).toBeLessThan(execLine);
     });
 
+    it("prefers exact per-tool avoided bytes over global ratio estimates", () => {
+      const report = makeReport({
+        savings: {
+          ...makeReport().savings,
+          total_calls: 2,
+          total_bytes_returned: 10_740,
+          kept_out: 9000,
+          by_tool: [
+            {
+              tool: "ctx_api_probe",
+              calls: 1,
+              context_kb: 0.5,
+              tokens: 125,
+              bytes_returned: 500,
+              bytes_avoided: 9000,
+            },
+            {
+              tool: "ctx_search",
+              calls: 1,
+              context_kb: 10,
+              tokens: 2560,
+              bytes_returned: 10_240,
+              bytes_avoided: 0,
+            },
+          ],
+        },
+      });
+      const output = formatReport(report);
+
+      const lines = output.split("\n");
+      const probeLine = lines.findIndex((l: string) => l.includes("ctx_api_probe"));
+      const searchLine = lines.findIndex((l: string) => l.includes("ctx_search"));
+      expect(probeLine).toBeGreaterThanOrEqual(0);
+      expect(searchLine).toBeGreaterThanOrEqual(0);
+      expect(probeLine).toBeLessThan(searchLine);
+      expect(lines[probeLine]).toContain("8.8 KB saved");
+    });
+
     it("does NOT show per-tool table when only 1 tool used", () => {
       const report = makeReport({
         savings: {

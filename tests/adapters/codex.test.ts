@@ -880,6 +880,7 @@ describe("Codex userpromptsubmit hook script", () => {
     const parsed = JSON.parse(stdout.trim());
     expect(parsed.hookSpecificOutput).toBeDefined();
     expect(parsed.hookSpecificOutput.hookEventName).toBe("UserPromptSubmit");
+    expect(parsed.hookSpecificOutput).not.toHaveProperty("additionalContext");
   });
 });
 
@@ -970,6 +971,44 @@ describe("Codex precompact hook script", () => {
 });
 
 describe("Codex sessionstart hook script", () => {
+  it("emits one compact routing block on startup", () => {
+    const hookScript = resolve(__dirname, "../../hooks/codex/sessionstart.mjs");
+    const codexHome = mkdtempSync(join(tmpdir(), "context-mode-codex-home-"));
+    const projectDir = join(codexHome, "project");
+    const savedCodexHome = process.env.CODEX_HOME;
+
+    mkdirSync(projectDir, { recursive: true });
+    process.env.CODEX_HOME = codexHome;
+
+    try {
+      const stdout = execFileSync(process.execPath, [hookScript], {
+        input: JSON.stringify({
+          session_id: "test-sessionstart-compact-routing",
+          cwd: projectDir,
+          hook_event_name: "SessionStart",
+          source: "startup",
+        }),
+        encoding: "utf-8",
+        timeout: 10000,
+        env: { ...process.env, CODEX_HOME: codexHome },
+      });
+
+      const parsed = JSON.parse(stdout.trim());
+      const ctx = parsed.hookSpecificOutput.additionalContext;
+      expect(parsed.hookSpecificOutput.hookEventName).toBe("SessionStart");
+      expect(ctx.match(/<context_window_protection>/g)).toHaveLength(1);
+      expect(Buffer.byteLength(ctx)).toBeLessThanOrEqual(2048);
+      expect(ctx).toContain("ctx_batch_execute");
+      expect(ctx).toContain("ctx_execute_file");
+      expect(ctx).toContain("ctx_fetch_and_index");
+      expect(ctx).toContain("ctx stats");
+    } finally {
+      if (savedCodexHome === undefined) delete process.env.CODEX_HOME;
+      else process.env.CODEX_HOME = savedCodexHome;
+      try { rmSync(codexHome, { recursive: true, force: true }); } catch { /* Windows may release SQLite handles late */ }
+    }
+  });
+
   it("injects a compact resume snapshot before marking it consumed", () => {
     const hookScript = resolve(__dirname, "../../hooks/codex/sessionstart.mjs");
     const codexHome = mkdtempSync(join(tmpdir(), "context-mode-codex-home-"));

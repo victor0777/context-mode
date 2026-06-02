@@ -19,6 +19,7 @@ import color from "picocolors";
 import { execFileSync, execSync, execFile as nodeExecFile, type ExecSyncOptions } from "node:child_process";
 import { readFileSync, writeFileSync, cpSync, accessSync, existsSync, readdirSync, rmSync, closeSync, openSync, chmodSync, mkdirSync, lstatSync, realpathSync, statSync, constants } from "node:fs";
 import { request as httpsRequest } from "node:https";
+import { randomBytes } from "node:crypto";
 import { resolve, dirname, join, sep, basename, isAbsolute } from "node:path";
 import { tmpdir, devNull, homedir } from "node:os";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -1252,6 +1253,7 @@ async function insight(port: number) {
       PORT: String(port),
       INSIGHT_SESSION_DIR: sessDir,
       INSIGHT_CONTENT_DIR: contentDir,
+      INSIGHT_DELETE_TOKEN: randomBytes(24).toString("hex"),
     },
     stdio: "inherit",
   });

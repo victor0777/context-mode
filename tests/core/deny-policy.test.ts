@@ -65,6 +65,30 @@ describe("checkFilePathDenyPolicy: project-dir resolution", () => {
   });
 });
 
+describe("shell deny policy: project-dir resolution", () => {
+  test("checkDenyPolicy uses canonical getProjectDir() helper", () => {
+    const fnMatch = serverSrc.match(
+      /function checkDenyPolicy[\s\S]*?^}/m,
+    );
+    expect(fnMatch).not.toBeNull();
+    const body = fnMatch![0];
+
+    expect(body).toMatch(/readBashPolicies\(getProjectDir\(\)\)/);
+    expect(body).not.toContain("process.env.CLAUDE_PROJECT_DIR");
+  });
+
+  test("checkNonShellDenyPolicy uses canonical getProjectDir() helper", () => {
+    const fnMatch = serverSrc.match(
+      /function checkNonShellDenyPolicy[\s\S]*?^}/m,
+    );
+    expect(fnMatch).not.toBeNull();
+    const body = fnMatch![0];
+
+    expect(body).toMatch(/readBashPolicies\(getProjectDir\(\)\)/);
+    expect(body).not.toContain("process.env.CLAUDE_PROJECT_DIR");
+  });
+});
+
 describe("evaluateFilePath: cross-platform separator normalization", () => {
   // On Windows the absolute deny rule arrives as `Read(C:\Users\...\secret.env)`,
   // which `parseToolPattern` returns with literal backslashes. The candidate

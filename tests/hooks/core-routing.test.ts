@@ -36,7 +36,7 @@ let routePreToolUse: (
 let resetGuidanceThrottle: () => void;
 let initSecurity: (buildDir: string) => Promise<boolean>;
 let ROUTING_BLOCK: string;
-let createRoutingBlock: (t: any, options?: { includeCommands?: boolean }) => string;
+let createRoutingBlock: (t: any, options?: { includeCommands?: boolean; verbosity?: "full" | "compact" }) => string;
 let READ_GUIDANCE: string;
 let GREP_GUIDANCE: string;
 
@@ -451,6 +451,18 @@ describe("routePreToolUse", () => {
       const t = (name: string) => `mcp__test__${name}`;
       const block = createRoutingBlock(t);
       expect(block).toContain("<ctx_commands>");
+    });
+
+    it("createRoutingBlock compact keeps required guidance under size budget", () => {
+      const t = (name: string) => name;
+      const block = createRoutingBlock(t, { verbosity: "compact" });
+      expect(Buffer.byteLength(block)).toBeLessThanOrEqual(2048);
+      expect(block).toContain("<context_window_protection>");
+      expect(block).toContain("<tool_selection_hierarchy>");
+      expect(block).toContain("ctx_batch_execute");
+      expect(block).toContain("ctx_execute_file");
+      expect(block).toContain("ctx_fetch_and_index");
+      expect(block).toContain("ctx stats");
     });
   });
 

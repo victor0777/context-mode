@@ -1,5 +1,13 @@
 const API = "/api";
 
+declare global {
+  interface Window {
+    __CONTEXT_MODE_INSIGHT__?: {
+      deleteToken?: string;
+    };
+  }
+}
+
 export interface OverviewData {
   content: { databases: number; sources: number; chunks: number; totalSize: string; totalSizeBytes: number };
   sessions: { databases: number; sessions: number; events: number; totalSize: string; totalSizeBytes: number };
@@ -129,6 +137,11 @@ async function get<T>(path: string): Promise<T> {
   return r.json() as Promise<T>;
 }
 
+function deleteHeaders(): HeadersInit {
+  const token = globalThis.window?.__CONTEXT_MODE_INSIGHT__?.deleteToken;
+  return token ? { "x-context-mode-delete-token": token } : {};
+}
+
 export const api = {
   overview: () => get<OverviewData>("/overview"),
   analytics: () => get<AnalyticsData>("/analytics"),
@@ -140,5 +153,5 @@ export const api = {
   events: (dbHash: string, sessionId: string) =>
     get<SessionEventData>(`/sessions/${dbHash}/events/${encodeURIComponent(sessionId)}`),
   deleteSource: (dbHash: string, sourceId: number) =>
-    fetch(`${API}/content/${dbHash}/source/${sourceId}`, { method: "DELETE" }).then(r => r.json() as Promise<{ ok: boolean }>),
+    fetch(`${API}/content/${dbHash}/source/${sourceId}`, { method: "DELETE", headers: deleteHeaders() }).then(r => r.json() as Promise<{ ok: boolean }>),
 };

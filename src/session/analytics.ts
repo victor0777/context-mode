@@ -140,6 +140,15 @@ export interface RuntimeStats {
   cacheBytesSaved: number;
 }
 
+export interface ToolSavingsReport {
+  tool: string;
+  calls: number;
+  context_kb: number;
+  tokens: number;
+  bytes_returned?: number;
+  bytes_avoided?: number;
+}
+
 /**
  * Index observability snapshot — point-in-time view of the persistent
  * content store. Optional input to `formatReport` so callers that don't
@@ -164,7 +173,7 @@ export interface FullReport {
     saved_kb: number;
     pct: number;
     savings_ratio: number;
-    by_tool: Array<{ tool: string; calls: number; context_kb: number; tokens: number }>;
+    by_tool: ToolSavingsReport[];
     total_calls: number;
     total_bytes_returned: number;
     kept_out: number;
@@ -448,16 +457,48 @@ export class AnalyticsEngine {
       ? Math.round((1 - totalBytesReturned / totalProcessed) * 100)
       : 0;
 
+    const exactToolBytes = new Map<string, { calls: number; bytesAvoided: number; bytesReturned: number }>();
+    if (sid) {
+      try {
+        const rows = this.db.prepare(
+          `SELECT data AS tool,
+                  COUNT(*) AS calls,
+                  COALESCE(SUM(bytes_avoided), 0) AS bytes_avoided,
+                  COALESCE(SUM(bytes_returned), 0) AS bytes_returned
+             FROM session_events
+            WHERE session_id = ?
+              AND data LIKE 'ctx_%'
+            GROUP BY data`,
+        ).all(sid) as Array<{ tool: string; calls: number; bytes_avoided: number; bytes_returned: number }>;
+        for (const row of rows) {
+          exactToolBytes.set(row.tool, {
+            calls: Number(row.calls ?? 0),
+            bytesAvoided: Number(row.bytes_avoided ?? 0),
+            bytesReturned: Number(row.bytes_returned ?? 0),
+          });
+        }
+      } catch {
+        // Historical test fixtures and DBs may not have byte columns yet.
+      }
+    }
+
     const toolNames = new Set([
       ...Object.keys(runtimeStats.calls),
       ...Object.keys(runtimeStats.bytesReturned),
+      ...exactToolBytes.keys(),
     ]);
-    const byTool = Array.from(toolNames).sort().map((tool) => ({
-      tool,
-      calls: runtimeStats.calls[tool] || 0,
-      context_kb: Math.round((runtimeStats.bytesReturned[tool] || 0) / 1024 * 10) / 10,
-      tokens: Math.round((runtimeStats.bytesReturned[tool] || 0) / 4),
-    }));
+    const byTool = Array.from(toolNames).sort().map((tool) => {
+      const exact = exactToolBytes.get(tool);
+      const returnedBytes = runtimeStats.bytesReturned[tool] ?? exact?.bytesReturned ?? 0;
+      return {
+        tool,
+        calls: runtimeStats.calls[tool] || exact?.calls || 0,
+        context_kb: Math.round(returnedBytes / 1024 * 10) / 10,
+        tokens: Math.round(returnedBytes / 4),
+        bytes_returned: returnedBytes,
+        bytes_avoided: exact?.bytesAvoided ?? 0,
+      };
+    });
 
     const uptimeMs = Date.now() - runtimeStats.sessionStart;
     const uptimeMin = (uptimeMs / 60_000).toFixed(1);
@@ -2924,20 +2965,23 @@ export function formatReport(
   if (activatedTools.length >= 2) {
     lines.push("");
 
-    // Estimate per-tool saved using global savings ratio
+    // Prefer exact per-tool avoided bytes when the event stream has them.
     const toolRows = activatedTools.map((t) => {
-      const returnedBytes = t.context_kb * 1024;
+      const returnedBytes = t.bytes_returned ?? t.context_kb * 1024;
       const estimatedTotal = savingsPct < 100
         ? returnedBytes / (1 - savingsPct / 100)
         : returnedBytes;
-      const estimatedSaved = Math.max(0, estimatedTotal - returnedBytes);
-      return { ...t, returnedBytes, estimatedSaved };
-    }).sort((a, b) => b.estimatedSaved - a.estimatedSaved);
+      const fallbackSaved = Math.max(0, estimatedTotal - returnedBytes);
+      const savedBytes = t.bytes_avoided && t.bytes_avoided > 0
+        ? t.bytes_avoided
+        : fallbackSaved;
+      return { ...t, returnedBytes, savedBytes };
+    }).sort((a, b) => b.savedBytes - a.savedBytes);
 
     // Compact table: tool name, calls, saved
     for (const t of toolRows) {
       const name = t.tool.length > 22 ? t.tool.slice(0, 19) + "..." : t.tool;
-      lines.push(`  ${name.padEnd(22)}  ${String(t.calls).padStart(4)} calls  ${kb(t.estimatedSaved).padStart(8)} saved`);
+      lines.push(`  ${name.padEnd(22)}  ${String(t.calls).padStart(4)} calls  ${kb(t.savedBytes).padStart(8)} saved`);
     }
   }
 
