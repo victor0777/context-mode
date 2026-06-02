@@ -350,6 +350,35 @@ describe("normalizeHooksOnStartup", () => {
     );
   });
 
+  test("leaves source-checkout plugin.json portable when .git exists", () => {
+    const dir = makeTmp();
+    mkdirSync(join(dir, ".git"), { recursive: true });
+    mkdirSync(join(dir, ".claude-plugin"), { recursive: true });
+    const pluginPath = join(dir, ".claude-plugin", "plugin.json");
+    const original = JSON.stringify(
+      {
+        name: "context-mode",
+        mcpServers: {
+          "context-mode": {
+            command: "node",
+            args: ["${CLAUDE_PLUGIN_ROOT}/start.mjs"],
+          },
+        },
+      },
+      null,
+      2,
+    );
+    writeFileSync(pluginPath, original);
+
+    normalizeHooksOnStartup({
+      pluginRoot: dir,
+      nodePath: "C:\\Program Files\\nodejs\\node.exe",
+      platform: "win32",
+    });
+
+    expect(readFileSync(pluginPath, "utf-8")).toBe(original);
+  });
+
   test("idempotent — second call leaves file unchanged on Windows", () => {
     const dir = makeTmp();
     mkdirSync(join(dir, "hooks"), { recursive: true });

@@ -84,6 +84,7 @@
     "scripts/heal-installed-plugins.mjs",
     "scripts/plugin-cache-integrity.mjs",
     "scripts/ctx-api-probe-savings-smoke.mjs",
+    "scripts/token-savings-benchmark.mjs",
     "README.md",
     "LICENSE"
   ],
@@ -107,6 +108,7 @@
     "test:compare": "npx tsx tests/context-comparison.ts",
     "test:ecosystem": "npx tsx tests/ecosystem-benchmark.ts",
     "smoke:api-probe-savings": "node scripts/ctx-api-probe-savings-smoke.mjs",
+    "benchmark:token-savings": "node scripts/token-savings-benchmark.mjs",
     "install:openclaw": "node -e \"if(process.platform==='win32'){console.error('OpenClaw install requires bash (Git Bash or WSL)');process.exit(1)}else{require('child_process').execSync('bash scripts/install-openclaw-plugin.sh',{stdio:'inherit'})}\"",
     "postinstall": "node scripts/postinstall.mjs"
   },

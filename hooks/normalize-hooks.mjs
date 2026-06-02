@@ -304,6 +304,12 @@ export function normalizeHooksOnStartup({ pluginRoot, nodePath, jsRuntimePath, p
   // exclusively by the hooks.json branch above.
   if (platform !== "win32" && platform !== "linux") return;
   if (!pluginRoot || !nodePath) return;
+  // Source checkouts must keep the committed manifest portable. When a dev/NFS
+  // checkout is used directly as a plugin root, start.mjs still runs this
+  // startup normalizer; without this guard it rewrites
+  // .claude-plugin/plugin.json to local absolute paths and the build-time
+  // asymmetric-drift assertion fails on the next `npm run build`.
+  if (existsSync(resolve(pluginRoot, ".git"))) return;
 
   // .claude-plugin/plugin.json
   try {
